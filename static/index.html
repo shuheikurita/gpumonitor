@@ -88,11 +88,11 @@ main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
 
 .server-body { padding: 14px 16px; }
 
-.gpu-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.gpu-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
 .gpu-row { display: flex; align-items: center; gap: 10px; }
 .gpu-label { font-size: 0.72rem; color: var(--muted); width: 46px; flex-shrink: 0; }
+.gpu-bars { flex: 1; display: flex; flex-direction: column; gap: 3px; }
 .bar-wrap {
-  flex: 1;
   height: 22px;
   background: var(--free);
   border-radius: 4px;
@@ -112,6 +112,22 @@ main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
   transition: width 0.4s ease;
 }
 .bar-free { background: var(--free); }
+.util-wrap {
+  height: 10px;
+  background: var(--free);
+  border-radius: 3px;
+  overflow: hidden;
+  display: flex;
+}
+.util-fill {
+  height: 100%;
+  background: #58a6ff44;
+  border-right: 2px solid #58a6ff;
+  transition: width 0.4s ease;
+  display: flex;
+  align-items: center;
+}
+.util-label { font-size: 0.62rem; color: var(--accent); padding-left: 4px; white-space: nowrap; }
 .mem-label { font-size: 0.72rem; color: var(--muted); width: 120px; text-align: right; flex-shrink: 0; }
 
 .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
@@ -197,21 +213,36 @@ function buildBars(serverData) {
 
   let html = '<div class="gpu-list">';
   for (const gpu of gpus) {
-    const { index, memory_total: total, memory_used: used, processes: procs } = gpu;
+    const { index, memory_total: total, memory_used: used, processes: procs, gpu_util } = gpu;
     const userMem = {};
     for (const p of (procs || [])) userMem[p.user] = (userMem[p.user] || 0) + p.memory;
 
+    const util = gpu_util ?? null;
+    const freePct = Math.max(0, (total - used) / total * 100).toFixed(2);
+
     html += `<div class="gpu-row">`;
     html += `<div class="gpu-label">GPU ${index}</div>`;
-    html += `<div class="bar-wrap" title="Total: ${fmtMem(total)}">`;
+    html += `<div class="gpu-bars">`;
+
+    // VRAM bar
+    html += `<div class="bar-wrap" title="VRAM: ${fmtMem(used)} / ${fmtMem(total)}">`;
     for (const [user, mem] of Object.entries(userMem)) {
       const pct = (mem / total * 100).toFixed(2);
       const color = userColor(user);
       html += `<div class="bar-seg" style="width:${pct}%;background:${color}"
                     title="${user}: ${fmtMem(mem)} (${fmtPct(mem,total)})">${parseFloat(pct) > 7 ? user : ''}</div>`;
     }
-    const freePct = Math.max(0, (total - used) / total * 100).toFixed(2);
     html += `<div class="bar-seg bar-free" style="width:${freePct}%"></div>`;
+    html += `</div>`;
+
+    // GPU utilization bar
+    if (util !== null) {
+      html += `<div class="util-wrap" title="GPU Util: ${util}%">`;
+      html += `<div class="util-fill" style="width:${util}%">`;
+      if (util > 5) html += `<span class="util-label">${util}%</span>`;
+      html += `</div></div>`;
+    }
+
     html += `</div>`;
     html += `<div class="mem-label">${fmtMem(used)} / ${fmtMem(total)} (${fmtPct(used,total)})</div>`;
     html += `</div>`;

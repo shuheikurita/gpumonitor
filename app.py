@@ -94,7 +94,7 @@ def collect_server(server: dict) -> tuple[str, list | None]:
 
     # Single call: GPU info + process info separated by a sentinel
     cmd = (
-        "nvidia-smi --query-gpu=index,uuid,memory.total,memory.used,name"
+        "nvidia-smi --query-gpu=index,uuid,memory.total,memory.used,name,utilization.gpu"
         " --format=csv,noheader,nounits 2>/dev/null;"
         " echo '===PROCS===';"
         " nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory"
@@ -112,14 +112,15 @@ def collect_server(server: dict) -> tuple[str, list | None]:
     # Parse GPUs: index, uuid, total_MiB, used_MiB
     gpus: dict[str, dict] = {}
     for line in gpu_section.splitlines():
-        p = [x.strip() for x in line.split(",", 4)]
-        if len(p) == 5:
+        p = [x.strip() for x in line.split(",", 5)]
+        if len(p) == 6:
             try:
                 gpus[p[1]] = {
                     "index": int(p[0]),
                     "memory_total": int(p[2]),
                     "memory_used": int(p[3]),
                     "name": p[4],
+                    "gpu_util": int(p[5]),
                     "processes": [],
                 }
             except ValueError:
