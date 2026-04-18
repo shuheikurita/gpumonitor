@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Runtime data
+data/
+
+# Secrets & local config (copy config.toml.example → config.toml to get started)
+config.toml
+id_rsa*
+server_list.txt

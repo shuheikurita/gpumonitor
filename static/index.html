@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPU Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+:root {
+  --bg: #0d1117;
+  --card: #161b22;
+  --card2: #1c2128;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --red: #f85149;
+  --free: #2d333b;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; }
+
+header {
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 24px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+h1 { font-size: 1.1rem; color: var(--accent); letter-spacing: 0.5px; }
+#hdr-status { font-size: 0.8rem; color: var(--muted); margin-left: auto; }
+#btn-refresh {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+#btn-refresh:hover { border-color: var(--accent); color: var(--accent); }
+
+main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+
+.server-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+}
+@media (max-width: 768px) {
+  .server-grid { grid-template-columns: 1fr; }
+}
+
+.server-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.server-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card2);
+}
+.server-name { font-size: 1rem; font-weight: 700; }
+.server-ip { font-size: 0.75rem; color: var(--muted); }
+.server-gpu-type { font-size: 0.75rem; color: var(--accent); background: rgba(88,166,255,0.1); padding: 1px 7px; border-radius: 10px; }
+.server-badge {
+  margin-left: auto;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 500;
+}
+.badge-ok   { background: rgba(63,185,80,0.15);   color: var(--green); }
+.badge-old  { background: rgba(248,81,73,0.15);   color: var(--red); }
+.badge-none { background: rgba(139,148,158,0.15); color: var(--muted); }
+
+.server-body { padding: 14px 16px; }
+
+.gpu-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.gpu-row { display: flex; align-items: center; gap: 10px; }
+.gpu-label { font-size: 0.72rem; color: var(--muted); width: 46px; flex-shrink: 0; }
+.bar-wrap {
+  flex: 1;
+  height: 22px;
+  background: var(--free);
+  border-radius: 4px;
+  overflow: hidden;
+  display: flex;
+}
+.bar-seg {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: rgba(255,255,255,0.92);
+  white-space: nowrap;
+  overflow: hidden;
+  transition: width 0.4s ease;
+}
+.bar-free { background: var(--free); }
+.mem-label { font-size: 0.72rem; color: var(--muted); width: 120px; text-align: right; flex-shrink: 0; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.legend-item { display: flex; align-items: center; gap: 5px; font-size: 0.75rem; color: var(--text); }
+.legend-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+
+.chart-title { font-size: 0.75rem; color: var(--muted); margin-bottom: 6px; }
+.chart-wrap { height: 180px; }
+
+.no-data { color: var(--muted); font-size: 0.85rem; padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#x1F4CA; GPU Monitor</h1>
+  <div id="hdr-status">Loading...</div>
+</header>
+<main id="main">
+  <div class="no-data" style="padding:40px;text-align:center">Loading...</div>
+</main>
+
+<script>
+// ── Color palette ──────────────────────────────────────────────────
+const PALETTE = [
+  '#4e9af1','#f4844b','#53c78e','#e85d99','#a66bfa',
+  '#f0c744','#4bc9cf','#e05252','#7ec85a','#c47ab9',
+  '#ff8a65','#64b5f6','#a5d6a7','#fff176','#ef9a9a',
+  '#ce93d8','#80cbc4','#ffcc80','#b0bec5','#f48fb1',
+];
+const userColorMap = {};
+let colorIdx = 0;
+function userColor(u) {
+  if (!userColorMap[u]) userColorMap[u] = PALETTE[colorIdx++ % PALETTE.length];
+  return userColorMap[u];
+}
+function hex2rgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+}
+
+// ── Formatting ─────────────────────────────────────────────────────
+function fmtMem(mib) {
+  return mib >= 1024 ? (mib / 1024).toFixed(1) + ' GiB' : mib + ' MiB';
+}
+function fmtPct(used, total) {
+  return total > 0 ? (used / total * 100).toFixed(0) + '%' : '0%';
+}
+function fmtAge(seconds) {
+  if (seconds < 10)  return 'just now';
+  if (seconds < 60)  return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  return `${Math.floor(seconds / 3600)}h ago`;
+}
+
+// ── Chart registry ─────────────────────────────────────────────────
+const chartRegistry = {};
+function destroyChart(id) {
+  if (chartRegistry[id]) { chartRegistry[id].destroy(); delete chartRegistry[id]; }
+}
+function destroyAllCharts(names) {
+  for (const name of names) destroyChart(name);
+}
+
+// ── GPU type summary ──────────────────────────────────────────────
+function gpuTypeSummary(serverData) {
+  const history = serverData.history || [];
+  if (!history.length) return '';
+  const gpus = history[history.length - 1].gpus || [];
+  const counts = {};
+  for (const g of gpus) {
+    const n = (g.name || '').replace(/^NVIDIA\s+/i, '').trim();
+    if (n) counts[n] = (counts[n] || 0) + 1;
+  }
+  return Object.entries(counts).map(([n, c]) => `${n} x ${c}`).join(', ');
+}
+
+// ── Build current-status bars ──────────────────────────────────────
+function buildBars(serverData) {
+  const history = serverData.history || [];
+  if (!history.length) return '<div class="no-data">No data yet</div>';
+  const gpus = history[history.length - 1].gpus || [];
+  if (!gpus.length) return '<div class="no-data">No GPUs found (nvidia-smi unavailable?)</div>';
+
+  let html = '<div class="gpu-list">';
+  for (const gpu of gpus) {
+    const { index, memory_total: total, memory_used: used, processes: procs } = gpu;
+    const userMem = {};
+    for (const p of (procs || [])) userMem[p.user] = (userMem[p.user] || 0) + p.memory;
+
+    html += `<div class="gpu-row">`;
+    html += `<div class="gpu-label">GPU ${index}</div>`;
+    html += `<div class="bar-wrap" title="Total: ${fmtMem(total)}">`;
+    for (const [user, mem] of Object.entries(userMem)) {
+      const pct = (mem / total * 100).toFixed(2);
+      const color = userColor(user);
+      html += `<div class="bar-seg" style="width:${pct}%;background:${color}"
+                    title="${user}: ${fmtMem(mem)} (${fmtPct(mem,total)})">${parseFloat(pct) > 7 ? user : ''}</div>`;
+    }
+    const freePct = Math.max(0, (total - used) / total * 100).toFixed(2);
+    html += `<div class="bar-seg bar-free" style="width:${freePct}%"></div>`;
+    html += `</div>`;
+    html += `<div class="mem-label">${fmtMem(used)} / ${fmtMem(total)} (${fmtPct(used,total)})</div>`;
+    html += `</div>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+// ── Build legend ───────────────────────────────────────────────────
+function buildLegend(serverData) {
+  const users = new Set();
+  for (const h of (serverData.history || [])) {
+    for (const g of (h.gpus || [])) {
+      for (const p of (g.processes || [])) users.add(p.user);
+    }
+  }
+  if (!users.size) return '';
+  let html = '<div class="legend">';
+  for (const u of users) {
+    html += `<div class="legend-item"><div class="legend-dot" style="background:${userColor(u)}"></div>${u}</div>`;
+  }
+  return html + '</div>';
+}
+
+// ── Build history chart (called AFTER innerHTML is set) ───────────
+function buildChart(serverName, serverData, canvasId) {
+  const history = serverData.history || [];
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || history.length < 2) return;
+
+  const users = new Set();
+  for (const h of history) {
+    for (const g of (h.gpus || [])) {
+      for (const p of (g.processes || [])) users.add(p.user);
+    }
+  }
+
+  const labels = history.map(h => new Date(h.timestamp * 1000));
+  const caps = history.map(h => (h.gpus || []).reduce((s, g) => s + g.memory_total, 0));
+  const maxCap = Math.max(...caps, 1);
+
+  const datasets = [];
+  for (const user of users) {
+    const col = userColor(user);
+    datasets.push({
+      label: user,
+      data: history.map(h =>
+        (h.gpus || []).reduce((s, g) =>
+          s + (g.processes || []).filter(p => p.user === user).reduce((ss, p) => ss + p.memory, 0), 0)
+      ),
+      backgroundColor: hex2rgba(col, 0.55),
+      borderColor: col,
+      borderWidth: 1.5,
+      fill: true,
+      tension: 0.3,
+      pointRadius: 0,
+      pointHoverRadius: 4,
+    });
+  }
+
+  chartRegistry[serverName] = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { intersect: false, mode: 'index' },
+      scales: {
+        x: {
+          type: 'time',
+          time: { unit: 'hour', displayFormats: { hour: 'HH:mm' } },
+          ticks: { color: '#8b949e', maxTicksLimit: 13, font: { size: 10 } },
+          grid: { color: '#21262d' },
+        },
+        y: {
+          stacked: true,
+          min: 0,
+          max: maxCap,
+          ticks: { color: '#8b949e', font: { size: 10 }, callback: v => fmtMem(v) },
+          grid: { color: '#21262d' },
+        },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: items => new Date(items[0].parsed.x).toLocaleTimeString(),
+            label: ctx => ` ${ctx.dataset.label}: ${fmtMem(ctx.raw)}`,
+          },
+        },
+      },
+    },
+  });
+}
+
+// ── Render page ────────────────────────────────────────────────────
+function renderPage(data, serverOrder) {
+  // Destroy all charts BEFORE replacing innerHTML
+  destroyAllCharts(serverOrder);
+
+  const main = document.getElementById('main');
+  let html = '';
+
+  for (const name of serverOrder) {
+    const sd = data[name];
+    if (!sd) continue;
+    const history = sd.history || [];
+    const canvasId = `chart-${name}`;
+
+    let badge, badgeClass;
+    if (!history.length) {
+      badge = 'No data'; badgeClass = 'badge-none';
+    } else {
+      const age = Math.floor(Date.now() / 1000) - history[history.length - 1].timestamp;
+      badgeClass = age > 150 ? 'badge-old' : 'badge-ok';
+      badge = fmtAge(age);
+    }
+
+    const gpuTypeLabel = gpuTypeSummary(sd);
+    html += `<div class="server-card">
+      <div class="server-header">
+        <span class="server-name">${name}</span>
+        <span class="server-ip">${sd.ip || ''}</span>
+        ${gpuTypeLabel ? `<span class="server-gpu-type">${gpuTypeLabel}</span>` : ''}
+        <span class="server-badge ${badgeClass}">${badge}</span>
+      </div>
+      <div class="server-body">
+        ${buildBars(sd)}
+        ${buildLegend(sd)}
+        ${history.length >= 2 ? `<div class="chart-title">24h VRAM Usage — all GPUs combined</div><div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>` : ''}
+      </div>
+    </div>`;
+  }
+
+  main.innerHTML = `<div class="server-grid">${html || '<div class="no-data" style="padding:40px;text-align:center">No server data</div>'}</div>`;
+
+  // Build charts after DOM is ready
+  for (const name of serverOrder) {
+    if (data[name]) buildChart(name, data[name], `chart-${name}`);
+  }
+}
+
+// ── Data fetch & refresh ───────────────────────────────────────────
+let serverOrder = [];
+
+async function refresh() {
+  try {
+    const data = await (await fetch('/api/data')).json();
+    renderPage(data, serverOrder);
+    const t = new Date().toLocaleTimeString();
+    document.getElementById('hdr-status').textContent = `Updated: ${t}  |  Auto-refresh: 60s`;
+  } catch (e) {
+    document.getElementById('hdr-status').textContent = 'Error loading data';
+  }
+}
+
+
+async function init() {
+  try {
+    const servers = await (await fetch('/api/servers')).json();
+    serverOrder = servers.map(s => s.name);
+  } catch (e) {}
+  await refresh();
+  setInterval(refresh, 60000);
+}
+
+init();
+</script>
+</body>
+</html>
