@@ -88,26 +88,71 @@ def ssh_run(ip: str, command: str, timeout: int = 30) -> str | None:
         return None
 
 
-def collect_server(server: dict) -> tuple[str, list | None]:
+def parse_sys(section: str) -> dict | None:
+    """Parse two /proc/stat cpu lines (1s apart) + /proc/meminfo into usage percentages."""
+    cpu_samples = []
+    mem = {}
+    for line in section.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "cpu":
+            try:
+                cpu_samples.append([int(x) for x in parts[1:]])
+            except ValueError:
+                pass
+        elif parts[0] == "MemTotal:":
+            mem["total"] = int(parts[1])  # kB
+        elif parts[0] == "MemAvailable:":
+            mem["available"] = int(parts[1])
+    if len(cpu_samples) < 2 or "total" not in mem or "available" not in mem or mem["total"] <= 0:
+        return None
+
+    def busy_total(f: list[int]) -> tuple[int, int]:
+        total = sum(f)
+        idle = f[3] + (f[4] if len(f) > 4 else 0)  # idle + iowait
+        return total - idle, total
+
+    b1, t1 = busy_total(cpu_samples[0])
+    b2, t2 = busy_total(cpu_samples[-1])
+    dt = t2 - t1
+    used_kb = mem["total"] - mem["available"]
+    return {
+        "cpu_percent": round((b2 - b1) / dt * 100, 1) if dt > 0 else 0.0,
+        "mem_percent": round(used_kb / mem["total"] * 100, 1),
+        "mem_total": mem["total"] // 1024,  # MiB
+        "mem_used": used_kb // 1024,        # MiB
+    }
+
+
+def collect_server(server: dict) -> tuple[str, list | None, dict | None]:
     ip = server["ip"]
     name = server["name"]
 
-    # Single call: GPU info + process info separated by a sentinel
+    # Single call: GPU info + process info + CPU/RAM info separated by sentinels
     cmd = (
         "nvidia-smi --query-gpu=index,uuid,memory.total,memory.used,name,utilization.gpu"
         " --format=csv,noheader,nounits 2>/dev/null;"
         " echo '===PROCS===';"
         " nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory"
-        " --format=csv,noheader,nounits 2>/dev/null"
+        " --format=csv,noheader,nounits 2>/dev/null;"
+        " echo '===SYS===';"
+        " head -1 /proc/stat;"
+        " grep -E 'MemTotal|MemAvailable' /proc/meminfo;"
+        " sleep 1;"
+        " head -1 /proc/stat"
     )
     output = ssh_run(ip, cmd)
     if output is None:
         log.warning(f"{name} ({ip}): unreachable")
-        return name, None
+        return name, None, None
 
     sections = output.split("===PROCS===")
     gpu_section = sections[0].strip()
-    proc_section = sections[1].strip() if len(sections) > 1 else ""
+    rest = sections[1] if len(sections) > 1 else ""
+    rest_sections = rest.split("===SYS===")
+    proc_section = rest_sections[0].strip()
+    sys_info = parse_sys(rest_sections[1]) if len(rest_sections) > 1 else None
 
     # Parse GPUs: index, uuid, total_MiB, used_MiB
     gpus: dict[str, dict] = {}
@@ -165,7 +210,7 @@ def collect_server(server: dict) -> tuple[str, list | None]:
 
     gpu_list = sorted(gpus.values(), key=lambda g: g["index"])
     log.info(f"{name}: {len(gpu_list)} GPU(s) collected")
-    return name, gpu_list
+    return name, gpu_list, sys_info
 
 
 def collect_all() -> None:
@@ -178,14 +223,17 @@ def collect_all() -> None:
         data = load_data()
 
     for server in servers:
-        name, gpu_list = collect_server(server)
+        name, gpu_list, sys_info = collect_server(server)
         if name not in data:
             data[name] = {"ip": server["ip"], "history": []}
         data[name]["history"] = [
             h for h in data[name]["history"] if h["timestamp"] > cutoff
         ]
         if gpu_list is not None:
-            data[name]["history"].append({"timestamp": now, "gpus": gpu_list})
+            entry = {"timestamp": now, "gpus": gpu_list}
+            if sys_info is not None:
+                entry["sys"] = sys_info
+            data[name]["history"].append(entry)
 
     with data_lock:
         save_data(data)

@@ -16,3 +16,6 @@ data/
 config.toml
 id_rsa*
 server_list.txt
+
+# Logs
+*.log

@@ -130,12 +130,19 @@ main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
 .util-label { font-size: 0.62rem; color: var(--accent); padding-left: 4px; white-space: nowrap; }
 .mem-label { font-size: 0.72rem; color: var(--muted); width: 120px; text-align: right; flex-shrink: 0; }
 
+.sys-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+.sys-wrap { height: 14px; border-radius: 4px; }
+.util-fill.ram { background: #3fb95044; border-right-color: var(--green); }
+.util-label.ram { color: var(--green); }
+
 .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .legend-item { display: flex; align-items: center; gap: 5px; font-size: 0.75rem; color: var(--text); }
 .legend-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
 
 .chart-title { font-size: 0.75rem; color: var(--muted); margin-bottom: 6px; }
+.chart-title .legend-dot { display: inline-block; vertical-align: middle; margin: -1px 4px 0 8px; }
 .chart-wrap { height: 180px; }
+.chart-wrap-sm { height: 90px; margin-top: 4px; }
 
 .no-data { color: var(--muted); font-size: 0.85rem; padding: 8px 0; }
 </style>
@@ -188,7 +195,7 @@ function destroyChart(id) {
   if (chartRegistry[id]) { chartRegistry[id].destroy(); delete chartRegistry[id]; }
 }
 function destroyAllCharts(names) {
-  for (const name of names) destroyChart(name);
+  for (const name of names) { destroyChart(name); destroyChart(name + '-sys'); }
 }
 
 // ── GPU type summary ──────────────────────────────────────────────
@@ -249,6 +256,36 @@ function buildBars(serverData) {
   }
   html += '</div>';
   return html;
+}
+
+// ── Build CPU / RAM bars ───────────────────────────────────────────
+function buildSysBars(serverData) {
+  const history = serverData.history || [];
+  if (!history.length) return '';
+  const sys = history[history.length - 1].sys;
+  if (!sys) return '';
+  const rows = [
+    { label: 'CPU', pct: sys.cpu_percent, cls: '',
+      detail: `${sys.cpu_percent}%` },
+    { label: 'RAM', pct: sys.mem_percent, cls: 'ram',
+      detail: `${fmtMem(sys.mem_used)} / ${fmtMem(sys.mem_total)} (${sys.mem_percent}%)` },
+  ];
+  let html = '<div class="sys-list">';
+  for (const r of rows) {
+    const w = Math.min(100, Math.max(0, r.pct));
+    html += `<div class="gpu-row">
+      <div class="gpu-label">${r.label}</div>
+      <div class="gpu-bars">
+        <div class="util-wrap sys-wrap" title="${r.label}: ${r.pct}%">
+          <div class="util-fill ${r.cls}" style="width:${w}%">
+            ${w > 5 ? `<span class="util-label ${r.cls}">${Math.round(r.pct)}%</span>` : ''}
+          </div>
+        </div>
+      </div>
+      <div class="mem-label">${r.detail}</div>
+    </div>`;
+  }
+  return html + '</div>';
 }
 
 // ── Build legend ───────────────────────────────────────────────────
@@ -339,6 +376,66 @@ function buildChart(serverName, serverData, canvasId) {
   });
 }
 
+// ── Build small CPU/RAM history chart ─────────────────────────────
+function buildSysChart(serverName, serverData, canvasId) {
+  const history = (serverData.history || []).filter(h => h.sys);
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || history.length < 2) return;
+
+  const labels = history.map(h => new Date(h.timestamp * 1000));
+  const mkDataset = (label, key, col) => ({
+    label,
+    data: history.map(h => h.sys[key]),
+    borderColor: col,
+    backgroundColor: hex2rgba(col, 0.12),
+    borderWidth: 1.5,
+    fill: true,
+    tension: 0.3,
+    pointRadius: 0,
+    pointHoverRadius: 3,
+  });
+
+  chartRegistry[serverName + '-sys'] = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        mkDataset('CPU', 'cpu_percent', '#58a6ff'),
+        mkDataset('RAM', 'mem_percent', '#3fb950'),
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { intersect: false, mode: 'index' },
+      scales: {
+        x: {
+          type: 'time',
+          time: { unit: 'hour', displayFormats: { hour: 'HH:mm' } },
+          ticks: { color: '#8b949e', maxTicksLimit: 13, font: { size: 10 } },
+          grid: { color: '#21262d' },
+        },
+        y: {
+          min: 0,
+          max: 100,
+          ticks: { color: '#8b949e', font: { size: 10 }, maxTicksLimit: 3, callback: v => v + '%' },
+          grid: { color: '#21262d' },
+        },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: items => new Date(items[0].parsed.x).toLocaleTimeString(),
+            label: ctx => ` ${ctx.dataset.label}: ${ctx.raw}%`,
+          },
+        },
+      },
+    },
+  });
+}
+
 // ── Render page ────────────────────────────────────────────────────
 function renderPage(data, serverOrder) {
   // Destroy all charts BEFORE replacing innerHTML
@@ -372,8 +469,10 @@ function renderPage(data, serverOrder) {
       </div>
       <div class="server-body">
         ${buildBars(sd)}
+        ${buildSysBars(sd)}
         ${buildLegend(sd)}
         ${history.length >= 2 ? `<div class="chart-title">24h VRAM Usage — all GPUs combined</div><div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>` : ''}
+        ${history.filter(h => h.sys).length >= 2 ? `<div class="chart-title" style="margin-top:12px">24h CPU / RAM<span class="legend-dot" style="background:#58a6ff"></span>CPU<span class="legend-dot" style="background:#3fb950"></span>RAM</div><div class="chart-wrap chart-wrap-sm"><canvas id="${canvasId}-sys"></canvas></div>` : ''}
       </div>
     </div>`;
   }
@@ -382,7 +481,10 @@ function renderPage(data, serverOrder) {
 
   // Build charts after DOM is ready
   for (const name of serverOrder) {
-    if (data[name]) buildChart(name, data[name], `chart-${name}`);
+    if (data[name]) {
+      buildChart(name, data[name], `chart-${name}`);
+      buildSysChart(name, data[name], `chart-${name}-sys`);
+    }
   }
 }
 

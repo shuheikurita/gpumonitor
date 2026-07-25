@@ -1,6 +1,6 @@
 # GPU Monitor
 
-A lightweight GPU monitoring dashboard that SSHes into a list of servers every minute, collects VRAM usage via `nvidia-smi`, and displays a live web UI with 24-hour history.
+A lightweight GPU monitoring dashboard that SSHes into a list of servers every minute, collects VRAM usage via `nvidia-smi` plus CPU / RAM usage via `/proc`, and displays a live web UI with 24-hour history.
 
 ## Setup
 
