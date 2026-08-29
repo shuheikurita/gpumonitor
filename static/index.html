@@ -216,7 +216,10 @@ function buildBars(serverData) {
   const history = serverData.history || [];
   if (!history.length) return '<div class="no-data">No data yet</div>';
   const gpus = history[history.length - 1].gpus || [];
-  if (!gpus.length) return '<div class="no-data">No GPUs found (nvidia-smi unavailable?)</div>';
+  if (!gpus.length) {
+    if (serverData.gpu === false) return '';
+    return '<div class="no-data">No GPUs found (nvidia-smi unavailable?)</div>';
+  }
 
   let html = '<div class="gpu-list">';
   for (const gpu of gpus) {
@@ -471,7 +474,7 @@ function renderPage(data, serverOrder) {
         ${buildBars(sd)}
         ${buildSysBars(sd)}
         ${buildLegend(sd)}
-        ${history.length >= 2 ? `<div class="chart-title">24h VRAM Usage — all GPUs combined</div><div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>` : ''}
+        ${sd.gpu !== false && history.length >= 2 ? `<div class="chart-title">24h VRAM Usage — all GPUs combined</div><div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>` : ''}
         ${history.filter(h => h.sys).length >= 2 ? `<div class="chart-title" style="margin-top:12px">24h CPU / RAM<span class="legend-dot" style="background:#58a6ff"></span>CPU<span class="legend-dot" style="background:#3fb950"></span>RAM</div><div class="chart-wrap chart-wrap-sm"><canvas id="${canvasId}-sys"></canvas></div>` : ''}
       </div>
     </div>`;

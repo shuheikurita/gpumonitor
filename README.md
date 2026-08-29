@@ -37,7 +37,16 @@ user = "your_username"
 [[servers]]
 ip   = "192.168.1.10"
 name = "gpu-node-01"
+
+[[servers]]
+ip   = "192.168.1.12"
+name = "cpu-node-01"
+gpu  = false   # no GPU: collect CPU/RAM only, skip nvidia-smi
 ```
+
+Servers that fail collection (unreachable, ssh timeout) are retried with
+exponential backoff (2 min doubling up to 30 min) instead of every cycle, so a
+node with a stalled auth path is not hammered with connection attempts.
 
 ## Data
 
