@@ -143,13 +143,81 @@ main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
 .chart-title .legend-dot { display: inline-block; vertical-align: middle; margin: -1px 4px 0 8px; }
 .chart-wrap { height: 180px; }
 .chart-wrap-sm { height: 90px; margin-top: 4px; }
+.chart-wrap-io { height: 120px; margin-top: 4px; }
 
 .no-data { color: var(--muted); font-size: 0.85rem; padding: 8px 0; }
+
+.alert {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(248,81,73,0.12);
+  border: 1px solid var(--red);
+  color: var(--red);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+.server-card.warn { border-color: var(--red); }
+
+#win-label { font-size: 0.8rem; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+#win-select {
+  background: var(--card2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+#win-select:hover { border-color: var(--accent); }
+
+.strata-toggle {
+  cursor: pointer;
+  user-select: none;
+  margin-left: 10px;
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card2);
+  color: var(--text);
+}
+.strata-toggle:hover { border-color: var(--accent); color: var(--accent); }
+.strata-box {
+  margin-top: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.7;
+  padding: 8px 10px;
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre;
+}
+.strata-time { color: var(--muted); }
+.strata-add  { color: var(--green); font-weight: 600; }
+.strata-del  { color: var(--red); }
+.strata-gap  { color: var(--muted); font-style: italic; }
+.strata-sep  { color: var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <h1>&#x1F4CA; GPU Monitor</h1>
+  <label id="win-label">Window
+    <select id="win-select">
+      <option value="24" selected>24h</option>
+      <option value="48">48h</option>
+      <option value="72">72h</option>
+      <option value="96">96h</option>
+      <option value="120">120h</option>
+    </select>
+  </label>
   <div id="hdr-status">Loading...</div>
 </header>
 <main id="main">
@@ -188,6 +256,110 @@ function fmtAge(seconds) {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
   return `${Math.floor(seconds / 3600)}h ago`;
 }
+function fmtStamp(ts) {
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ── Display window (hours) ─────────────────────────────────────────
+function winHours() {
+  return parseInt(document.getElementById('win-select').value, 10) || 24;
+}
+
+// Cap plotted points so long windows stay responsive; charts only —
+// the event log below always uses the full-resolution history.
+function decimate(arr, maxPts = 1440) {
+  const step = Math.ceil(arr.length / maxPts);
+  if (step <= 1) return arr;
+  const out = [];
+  for (let i = 0; i < arr.length; i += step) out.push(arr[i]);
+  if (out[out.length - 1] !== arr[arr.length - 1]) out.push(arr[arr.length - 1]);
+  return out;
+}
+
+// ── Usage event log ("strata" view) ────────────────────────────────
+// One row per change point: who started / stopped on which GPU, plus the
+// resulting occupancy, newest first. Answers "who hopped onto whose GPU when".
+function strataState(h) {
+  const m = new Map(); // "gpu:user" -> MiB
+  for (const g of (h.gpus || [])) {
+    for (const p of (g.processes || [])) {
+      const k = g.index + ' ' + p.user;
+      m.set(k, (m.get(k) || 0) + p.memory);
+    }
+  }
+  return m;
+}
+function strataOccupancy(m) {
+  if (!m.size) return '<span class="strata-sep">(all GPUs idle)</span>';
+  const byGpu = {};
+  for (const [k, mem] of m) {
+    const [gi, u] = k.split(' ');
+    (byGpu[gi] ??= []).push(`<span style="color:${userColor(u)}">${esc(u)}</span> ${fmtMem(mem)}`);
+  }
+  return Object.keys(byGpu).sort((a, b) => a - b)
+    .map(gi => `GPU${gi}[${byGpu[gi].join(', ')}]`).join('  ');
+}
+function buildStrata(serverData) {
+  const history = serverData.history || [];
+  if (!history.length) return '<div class="no-data">No data</div>';
+
+  const rows = [];
+  let prev = new Map();
+  let prevTs = null;
+  let inDropout = false;
+  for (const h of history) {
+    if (prevTs !== null && h.timestamp - prevTs > 300) {
+      rows.push(`<span class="strata-gap">     ~ no data for ${Math.round((h.timestamp - prevTs) / 60)} min ~</span>`);
+    }
+    // Empty gpus on a GPU server = nvidia-smi failure: observation lost,
+    // not everyone leaving. Keep prev state so recovery diffs stay correct.
+    if (serverData.gpu !== false && !(h.gpus || []).length && prevTs !== null) {
+      if (!inDropout) {
+        rows.push(`<span class="strata-time">${fmtStamp(h.timestamp)}</span>  <span class="strata-gap">~ no GPUs found (nvidia-smi unavailable?) ~</span>`);
+      }
+      inDropout = true;
+      prevTs = h.timestamp;
+      continue;
+    }
+    inDropout = false;
+    const cur = strataState(h);
+    const deltas = [];
+    for (const [k, mem] of cur) {
+      if (!prev.has(k)) {
+        const [gi, u] = k.split(' ');
+        deltas.push(`<span class="strata-add">+</span> <span style="color:${userColor(u)}">${esc(u)}</span> &#x25B6; GPU${gi} (${fmtMem(mem)})`);
+      }
+    }
+    for (const k of prev.keys()) {
+      if (!cur.has(k)) {
+        const [gi, u] = k.split(' ');
+        deltas.push(`<span class="strata-del">-</span> <span style="color:${userColor(u)}">${esc(u)}</span> leaves GPU${gi}`);
+      }
+    }
+    const isFirst = prevTs === null;
+    if (deltas.length || isFirst) {
+      // The first sample is the window boundary, not real start events
+      const head = isFirst
+        ? '<span class="strata-sep">window start</span>'
+        : deltas.join(', ');
+      rows.push(`<span class="strata-time">${fmtStamp(h.timestamp)}</span>  ${head}  <span class="strata-sep">&#x2502;</span>  ${strataOccupancy(cur)}`);
+    }
+    prev = cur;
+    prevTs = h.timestamp;
+  }
+  rows.reverse(); // newest first
+  const MAX_ROWS = 600;
+  const shown = rows.slice(0, MAX_ROWS);
+  if (rows.length > MAX_ROWS) {
+    shown.push(`<span class="strata-gap">... ${rows.length - MAX_ROWS} older change(s) not shown ...</span>`);
+  }
+  return shown.join('\n');
+}
 
 // ── Chart registry ─────────────────────────────────────────────────
 const chartRegistry = {};
@@ -195,14 +367,20 @@ function destroyChart(id) {
   if (chartRegistry[id]) { chartRegistry[id].destroy(); delete chartRegistry[id]; }
 }
 function destroyAllCharts(names) {
-  for (const name of names) { destroyChart(name); destroyChart(name + '-sys'); }
+  for (const name of names) {
+    destroyChart(name); destroyChart(name + '-sys');
+    destroyChart(name + '-io'); destroyChart(name + '-net');
+  }
 }
 
 // ── GPU type summary ──────────────────────────────────────────────
 function gpuTypeSummary(serverData) {
   const history = serverData.history || [];
   if (!history.length) return '';
-  const gpus = history[history.length - 1].gpus || [];
+  // Use the newest entry that actually saw GPUs, so the chip survives
+  // a temporary nvidia-smi dropout.
+  const withGpus = [...history].reverse().find(h => (h.gpus || []).length);
+  const gpus = withGpus ? withGpus.gpus : [];
   const counts = {};
   for (const g of gpus) {
     const n = (g.name || '').replace(/^NVIDIA\s+/i, '').trim();
@@ -216,10 +394,7 @@ function buildBars(serverData) {
   const history = serverData.history || [];
   if (!history.length) return '<div class="no-data">No data yet</div>';
   const gpus = history[history.length - 1].gpus || [];
-  if (!gpus.length) {
-    if (serverData.gpu === false) return '';
-    return '<div class="no-data">No GPUs found (nvidia-smi unavailable?)</div>';
-  }
+  if (!gpus.length) return '';  // GPU-less server, or dropout (alert banner covers it)
 
   let html = '<div class="gpu-list">';
   for (const gpu of gpus) {
@@ -309,7 +484,7 @@ function buildLegend(serverData) {
 
 // ── Build history chart (called AFTER innerHTML is set) ───────────
 function buildChart(serverName, serverData, canvasId) {
-  const history = serverData.history || [];
+  const history = decimate(serverData.history || []);
   const canvas = document.getElementById(canvasId);
   if (!canvas || history.length < 2) return;
 
@@ -324,14 +499,26 @@ function buildChart(serverName, serverData, canvasId) {
   const caps = history.map(h => (h.gpus || []).reduce((s, g) => s + g.memory_total, 0));
   const maxCap = Math.max(...caps, 1);
 
+  // Per point: user -> set of GPU indices in use (for the tooltip)
+  const userGpuAt = history.map(h => {
+    const m = {};
+    for (const g of (h.gpus || [])) {
+      for (const p of (g.processes || [])) (m[p.user] ??= new Set()).add(g.index);
+    }
+    return m;
+  });
+
   const datasets = [];
   for (const user of users) {
     const col = userColor(user);
     datasets.push({
       label: user,
+      // null (gap) when nvidia-smi returned nothing: usage is unknown, not zero
       data: history.map(h =>
-        (h.gpus || []).reduce((s, g) =>
-          s + (g.processes || []).filter(p => p.user === user).reduce((ss, p) => ss + p.memory, 0), 0)
+        (h.gpus || []).length
+          ? (h.gpus || []).reduce((s, g) =>
+              s + (g.processes || []).filter(p => p.user === user).reduce((ss, p) => ss + p.memory, 0), 0)
+          : null
       ),
       backgroundColor: hex2rgba(col, 0.55),
       borderColor: col,
@@ -354,7 +541,9 @@ function buildChart(serverName, serverData, canvasId) {
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'hour', displayFormats: { hour: 'HH:mm' } },
+          time: winHours() > 48
+            ? { unit: 'day', displayFormats: { day: 'MM/dd' } }
+            : { unit: 'hour', displayFormats: { hour: 'HH:mm' } },
           ticks: { color: '#8b949e', maxTicksLimit: 13, font: { size: 10 } },
           grid: { color: '#21262d' },
         },
@@ -369,9 +558,15 @@ function buildChart(serverName, serverData, canvasId) {
       plugins: {
         legend: { display: false },
         tooltip: {
+          filter: item => item.raw > 0,
           callbacks: {
-            title: items => new Date(items[0].parsed.x).toLocaleTimeString(),
-            label: ctx => ` ${ctx.dataset.label}: ${fmtMem(ctx.raw)}`,
+            title: items => items.length ? fmtStamp(items[0].parsed.x / 1000) : '',
+            label: ctx => {
+              const gset = userGpuAt[ctx.dataIndex]?.[ctx.dataset.label];
+              const gpus = gset && gset.size
+                ? ` — GPU ${[...gset].sort((a, b) => a - b).join(',')}` : '';
+              return ` ${ctx.dataset.label}: ${fmtMem(ctx.raw)}${gpus}`;
+            },
           },
         },
       },
@@ -381,7 +576,7 @@ function buildChart(serverName, serverData, canvasId) {
 
 // ── Build small CPU/RAM history chart ─────────────────────────────
 function buildSysChart(serverName, serverData, canvasId) {
-  const history = (serverData.history || []).filter(h => h.sys);
+  const history = decimate((serverData.history || []).filter(h => h.sys));
   const canvas = document.getElementById(canvasId);
   if (!canvas || history.length < 2) return;
 
@@ -415,7 +610,9 @@ function buildSysChart(serverName, serverData, canvasId) {
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'hour', displayFormats: { hour: 'HH:mm' } },
+          time: winHours() > 48
+            ? { unit: 'day', displayFormats: { day: 'MM/dd' } }
+            : { unit: 'hour', displayFormats: { hour: 'HH:mm' } },
           ticks: { color: '#8b949e', maxTicksLimit: 13, font: { size: 10 } },
           grid: { color: '#21262d' },
         },
@@ -439,12 +636,145 @@ function buildSysChart(serverName, serverData, canvasId) {
   });
 }
 
+// ── Disk / network I/O rate charts ────────────────────────────────
+function fmtRate(bps) {
+  if (bps == null) return '-';
+  if (bps >= 1e9) return (bps / 1e9).toFixed(2) + ' GB/s';
+  if (bps >= 1e6) return (bps / 1e6).toFixed(1) + ' MB/s';
+  if (bps >= 1e3) return (bps / 1e3).toFixed(0) + ' kB/s';
+  return bps.toFixed(0) + ' B/s';
+}
+
+// Cumulative byte counters -> per-interval average rate (B/s).
+// null on counter reset (reboot) or gaps, so the line breaks there.
+function rateSeries(hist, getter) {
+  const pts = [];
+  for (let i = 1; i < hist.length; i++) {
+    const a = getter(hist[i - 1]), b = getter(hist[i]);
+    const dt = hist[i].timestamp - hist[i - 1].timestamp;
+    let y = null;
+    if (a != null && b != null && b >= a && dt > 0 && dt < 3600) y = (b - a) / dt;
+    pts.push({ x: new Date(hist[i].timestamp * 1000), y });
+  }
+  return pts;
+}
+
+function rateChartOptions() {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    interaction: { intersect: false, mode: 'index' },
+    scales: {
+      x: {
+        type: 'time',
+        time: winHours() > 48
+          ? { unit: 'day', displayFormats: { day: 'MM/dd' } }
+          : { unit: 'hour', displayFormats: { hour: 'HH:mm' } },
+        ticks: { color: '#8b949e', maxTicksLimit: 13, font: { size: 10 } },
+        grid: { color: '#21262d' },
+      },
+      y: {
+        min: 0,
+        ticks: { color: '#8b949e', font: { size: 10 }, maxTicksLimit: 4, callback: v => fmtRate(v) },
+        grid: { color: '#21262d' },
+      },
+    },
+    plugins: {
+      legend: {
+        display: true,
+        labels: { color: '#8b949e', font: { size: 9 }, boxWidth: 14, boxHeight: 2 },
+      },
+      tooltip: {
+        callbacks: {
+          title: items => items.length ? fmtStamp(items[0].parsed.x / 1000) : '',
+          label: ctx => ` ${ctx.dataset.label}: ${fmtRate(ctx.parsed.y)}`,
+        },
+      },
+    },
+  };
+}
+
+const IO_COLORS = ['#4e9af1', '#f4844b', '#53c78e', '#e85d99'];
+
+function buildIoCharts(serverName, serverData) {
+  const hist = decimate((serverData.history || []).filter(h => h.io));
+  if (hist.length < 2) return;
+  const lineBase = { borderWidth: 1.5, fill: false, tension: 0.3, pointRadius: 0, pointHoverRadius: 3, spanGaps: false };
+
+  const diskCanvas = document.getElementById(`chart-${serverName}-io`);
+  if (diskCanvas) {
+    const vols = [...new Set(hist.flatMap(h => Object.keys(h.io.disks || {})))].sort();
+    const datasets = [];
+    vols.forEach((vol, i) => {
+      const col = IO_COLORS[i % IO_COLORS.length];
+      datasets.push({ ...lineBase, label: `${vol} read`,
+        data: rateSeries(hist, h => h.io.disks?.[vol]?.read), borderColor: col });
+      datasets.push({ ...lineBase, label: `${vol} write`,
+        data: rateSeries(hist, h => h.io.disks?.[vol]?.write), borderColor: col, borderDash: [5, 3] });
+    });
+    if (datasets.length) {
+      chartRegistry[serverName + '-io'] = new Chart(diskCanvas,
+        { type: 'line', data: { datasets }, options: rateChartOptions() });
+    }
+  }
+
+  const netCanvas = document.getElementById(`chart-${serverName}-net`);
+  if (netCanvas && hist.some(h => h.io.net)) {
+    const datasets = [
+      { ...lineBase, label: 'in (rx)',  data: rateSeries(hist, h => h.io.net?.rx), borderColor: '#3fb950' },
+      { ...lineBase, label: 'out (tx)', data: rateSeries(hist, h => h.io.net?.tx), borderColor: '#58a6ff' },
+    ];
+
+    // Per-peer breakdown per interval, e.g. " — kashiwa100 80% · liat300 19%".
+    // Index-aligned with rateSeries points (interval hist[i-1] -> hist[i]).
+    const peerNote = { rx: [], tx: [] };
+    for (let i = 1; i < hist.length; i++) {
+      const a = hist[i - 1], b = hist[i];
+      const dt = b.timestamp - a.timestamp;
+      for (const key of ['rx', 'tx']) {
+        let txt = '';
+        const pa = a.io.peers || {}, pb = b.io.peers || {};
+        const total = (a.io.net && b.io.net && dt > 0) ? (b.io.net[key] - a.io.net[key]) / dt : 0;
+        const rates = [];
+        if (dt > 0 && total > 0) {
+          for (const [ip, cb] of Object.entries(pb)) {
+            const ca = pa[ip];
+            if (!ca) continue; // new/reconnected peer: no baseline this interval
+            const d = cb[key] - ca[key];
+            if (d > 0) rates.push([ip, d / dt]);
+          }
+        }
+        if (rates.length) {
+          rates.sort((x, y) => y[1] - x[1]);
+          const parts = rates.slice(0, 4)
+            .map(([ip, r]) => [ip, Math.round(r / total * 100)])
+            .filter(([, pct]) => pct >= 1)
+            .map(([ip, pct]) => `${ipNames[ip] || ip} ${pct}%`);
+          if (rates.length > 4) parts.push('…');
+          if (parts.length) txt = ' — ' + parts.join(' · ');
+        }
+        peerNote[key].push(txt);
+      }
+    }
+
+    const opts = rateChartOptions();
+    opts.plugins.tooltip.callbacks.label = ctx => {
+      const key = ctx.datasetIndex === 0 ? 'rx' : 'tx';
+      return ` ${ctx.dataset.label}: ${fmtRate(ctx.parsed.y)}${peerNote[key][ctx.dataIndex] || ''}`;
+    };
+    chartRegistry[serverName + '-net'] = new Chart(netCanvas,
+      { type: 'line', data: { datasets }, options: opts });
+  }
+}
+
 // ── Render page ────────────────────────────────────────────────────
 function renderPage(data, serverOrder) {
   // Destroy all charts BEFORE replacing innerHTML
   destroyAllCharts(serverOrder);
 
   const main = document.getElementById('main');
+  const hours = winHours();
   let html = '';
 
   for (const name of serverOrder) {
@@ -462,8 +792,22 @@ function renderPage(data, serverOrder) {
       badge = fmtAge(age);
     }
 
+    // Prominent warnings: collection stopped, or nvidia-smi lost the GPUs
+    let alerts = '';
+    if (history.length) {
+      const last = history[history.length - 1];
+      const age = Math.floor(Date.now() / 1000) - last.timestamp;
+      if (age > 300) {
+        alerts += `<div class="alert">&#x26A0;&#xFE0F; No data since ${fmtStamp(last.timestamp)} (${fmtAge(age)}) — collection failing, host may be unreachable</div>`;
+      }
+      if (sd.gpu !== false && !(last.gpus || []).length) {
+        const lastSeen = [...history].reverse().find(h => (h.gpus || []).length);
+        alerts += `<div class="alert">&#x26A0;&#xFE0F; No GPUs found (nvidia-smi unavailable?)${lastSeen ? ` — GPUs last seen ${fmtStamp(lastSeen.timestamp)}` : ''}</div>`;
+      }
+    }
+
     const gpuTypeLabel = gpuTypeSummary(sd);
-    html += `<div class="server-card">
+    html += `<div class="server-card${alerts ? ' warn' : ''}">
       <div class="server-header">
         <span class="server-name">${name}</span>
         <span class="server-ip">${sd.ip || ''}</span>
@@ -471,11 +815,14 @@ function renderPage(data, serverOrder) {
         <span class="server-badge ${badgeClass}">${badge}</span>
       </div>
       <div class="server-body">
+        ${alerts}
         ${buildBars(sd)}
         ${buildSysBars(sd)}
         ${buildLegend(sd)}
-        ${sd.gpu !== false && history.length >= 2 ? `<div class="chart-title">24h VRAM Usage — all GPUs combined</div><div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>` : ''}
-        ${history.filter(h => h.sys).length >= 2 ? `<div class="chart-title" style="margin-top:12px">24h CPU / RAM<span class="legend-dot" style="background:#58a6ff"></span>CPU<span class="legend-dot" style="background:#3fb950"></span>RAM</div><div class="chart-wrap chart-wrap-sm"><canvas id="${canvasId}-sys"></canvas></div>` : ''}
+        ${sd.gpu !== false && history.length >= 2 ? `<div class="chart-title">${hours}h VRAM Usage — all GPUs combined<span class="strata-toggle" data-server="${name}" title="Usage event log: who started/stopped on which GPU">${strataOpen[name] ? '&#x1F53D; usage log' : '&#x25B7; usage log'}</span></div><div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>${strataOpen[name] ? `<div class="strata-box">${buildStrata(sd)}</div>` : ''}` : ''}
+        ${history.filter(h => h.sys).length >= 2 ? `<div class="chart-title" style="margin-top:12px">${hours}h CPU / RAM<span class="legend-dot" style="background:#58a6ff"></span>CPU<span class="legend-dot" style="background:#3fb950"></span>RAM</div><div class="chart-wrap chart-wrap-sm"><canvas id="${canvasId}-sys"></canvas></div>` : ''}
+        ${history.filter(h => h.io && h.io.disks && Object.keys(h.io.disks).length).length >= 2 ? `<div class="chart-title" style="margin-top:12px">${hours}h Disk I/O — read solid, write dashed</div><div class="chart-wrap chart-wrap-io"><canvas id="${canvasId}-io"></canvas></div>` : ''}
+        ${history.filter(h => h.io && h.io.net).length >= 2 ? `<div class="chart-title" style="margin-top:12px">${hours}h Network (NFS traffic)</div><div class="chart-wrap chart-wrap-io"><canvas id="${canvasId}-net"></canvas></div>` : ''}
       </div>
     </div>`;
   }
@@ -487,16 +834,21 @@ function renderPage(data, serverOrder) {
     if (data[name]) {
       buildChart(name, data[name], `chart-${name}`);
       buildSysChart(name, data[name], `chart-${name}-sys`);
+      buildIoCharts(name, data[name]);
     }
   }
 }
 
 // ── Data fetch & refresh ───────────────────────────────────────────
 let serverOrder = [];
+let lastData = {};
+const strataOpen = {};  // server name -> event log expanded?
+const ipNames = {};     // ip -> server name (for the NFS peer breakdown)
 
 async function refresh() {
   try {
-    const data = await (await fetch('/api/data')).json();
+    const data = await (await fetch('/api/data?hours=' + winHours())).json();
+    lastData = data;
     renderPage(data, serverOrder);
     const t = new Date().toLocaleTimeString();
     document.getElementById('hdr-status').textContent = `Updated: ${t}  |  Auto-refresh: 60s`;
@@ -507,9 +859,30 @@ async function refresh() {
 
 
 async function init() {
+  const sel = document.getElementById('win-select');
+  try {
+    const saved = localStorage.getItem('winHours');
+    if (saved && [...sel.options].some(o => o.value === saved)) sel.value = saved;
+  } catch (e) {}
+  sel.addEventListener('change', () => {
+    try { localStorage.setItem('winHours', sel.value); } catch (e) {}
+    refresh();
+  });
+
+  // Toggle the per-server usage event log (state survives re-renders)
+  document.getElementById('main').addEventListener('click', e => {
+    const t = e.target.closest('.strata-toggle');
+    if (!t) return;
+    const n = t.dataset.server;
+    strataOpen[n] = !strataOpen[n];
+    renderPage(lastData, serverOrder);
+  });
+
   try {
     const servers = await (await fetch('/api/servers')).json();
     serverOrder = servers.map(s => s.name);
+    for (const s of servers) ipNames[s.ip] = s.name;
+    Object.assign(ipNames, await (await fetch('/api/peer_names')).json());
   } catch (e) {}
   await refresh();
   setInterval(refresh, 60000);

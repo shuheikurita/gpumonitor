@@ -2,13 +2,14 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 import tomllib
 from pathlib import Path
 
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -125,10 +126,67 @@ def parse_sys(section: str) -> dict | None:
     }
 
 
-def collect_server(server: dict) -> tuple[str, list | None, dict | None]:
+def parse_peers(section: str) -> dict | None:
+    """Parse `ss -tinHO` lines into per-peer cumulative byte counters.
+
+    NFS clients hold long-lived TCP connections, so per-socket bytes_received
+    (client -> NAS = rx) and bytes_acked (NAS -> client = tx) summed per peer
+    IP give a per-client traffic breakdown for free.
+    """
+    peers: dict[str, dict] = {}
+    for line in section.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or ":" not in parts[3]:
+            continue
+        ip = parts[3].rsplit(":", 1)[0].strip("[]").removeprefix("::ffff:")
+        acked = re.search(r"bytes_acked:(\d+)", line)
+        recvd = re.search(r"bytes_received:(\d+)", line)
+        if not (acked or recvd):
+            continue
+        p = peers.setdefault(ip, {"rx": 0, "tx": 0})
+        p["tx"] += int(acked.group(1)) if acked else 0
+        p["rx"] += int(recvd.group(1)) if recvd else 0
+    return peers or None
+
+
+def parse_io(section: str, disks: list[dict]) -> dict | None:
+    """Parse /proc/diskstats + /proc/net/dev lines into cumulative byte counters.
+
+    Counters only (no extra disk load); the frontend turns consecutive samples
+    into rates. Sectors in diskstats are always 512 bytes.
+    """
+    dev_label = {d["dev"]: d.get("label", d["dev"]) for d in disks}
+    out: dict = {"disks": {}, "net": None}
+    parts_sec = section.split("---PEERS---")
+    peers = parse_peers(parts_sec[1]) if len(parts_sec) > 1 else None
+    if peers:
+        out["peers"] = peers
+    for line in parts_sec[0].splitlines():
+        parts = line.split()
+        if len(parts) >= 10 and parts[2] in dev_label:
+            try:
+                out["disks"][dev_label[parts[2]]] = {
+                    "read": int(parts[5]) * 512,
+                    "write": int(parts[9]) * 512,
+                }
+            except ValueError:
+                pass
+        elif len(parts) >= 10 and parts[0].endswith(":"):
+            try:
+                out["net"] = {"rx": int(parts[1]), "tx": int(parts[9])}
+            except ValueError:
+                pass
+    if not out["disks"] and out["net"] is None and not peers:
+        return None
+    return out
+
+
+def collect_server(server: dict) -> tuple[str, list | None, dict | None, dict | None]:
     ip = server["ip"]
     name = server["name"]
     has_gpu = server.get("gpu", True)
+    disks = server.get("disks", [])
+    netdev = server.get("netdev")
 
     # Single call: GPU info + process info + PID owners + CPU/RAM info separated
     # by sentinels. Everything happens in ONE ssh connection per cycle: on a
@@ -146,6 +204,19 @@ def collect_server(server: dict) -> tuple[str, list | None, dict | None]:
         if has_gpu
         else "echo '===PROCS==='; echo '===USERS===';"
     )
+    nfs_peers = server.get("nfs_peers", False)
+    io_cmd = ""
+    if disks or netdev or nfs_peers:
+        io_cmd = " ; echo '===IO==='"
+        if disks:
+            dev_re = "|".join(d["dev"] for d in disks)
+            io_cmd += f"; grep -E ' ({dev_re}) ' /proc/diskstats"
+        if netdev:
+            io_cmd += f"; grep -E '^ *{netdev}:' /proc/net/dev"
+        if nfs_peers:
+            # both directions: this host as NFS server (sport) and client (dport)
+            io_cmd += "; echo '---PEERS---'; ss -tinHO state established '( sport = :2049 or dport = :2049 )' 2>/dev/null"
+
     cmd = (
         gpu_cmd
         + " echo '===SYS===';"
@@ -153,11 +224,12 @@ def collect_server(server: dict) -> tuple[str, list | None, dict | None]:
         " grep -E 'MemTotal|MemAvailable' /proc/meminfo;"
         " sleep 1;"
         " head -1 /proc/stat"
+        + io_cmd
     )
     output = ssh_run(ip, cmd)
     if output is None:
         log.warning(f"{name} ({ip}): unreachable")
-        return name, None, None
+        return name, None, None, None
 
     sections = output.split("===PROCS===")
     gpu_section = sections[0].strip()
@@ -167,7 +239,10 @@ def collect_server(server: dict) -> tuple[str, list | None, dict | None]:
     rest2 = rest_sections[1] if len(rest_sections) > 1 else ""
     rest2_sections = rest2.split("===SYS===")
     users_section = rest2_sections[0].strip()
-    sys_info = parse_sys(rest2_sections[1]) if len(rest2_sections) > 1 else None
+    sys_tail = rest2_sections[1] if len(rest2_sections) > 1 else ""
+    sys_sections = sys_tail.split("===IO===")
+    sys_info = parse_sys(sys_sections[0]) if sys_tail else None
+    io_info = parse_io(sys_sections[1], disks) if len(sys_sections) > 1 else None
 
     # Parse GPUs: index, uuid, total_MiB, used_MiB
     gpus: dict[str, dict] = {}
@@ -222,7 +297,7 @@ def collect_server(server: dict) -> tuple[str, list | None, dict | None]:
         log.info(f"{name}: {len(gpu_list)} GPU(s) collected")
     else:
         log.info(f"{name}: sys info collected (no GPU)")
-    return name, gpu_list, sys_info
+    return name, gpu_list, sys_info, io_info
 
 
 # Per-server failure backoff. A node whose home filesystem (e.g. NFS) is
@@ -254,7 +329,7 @@ def collect_all() -> None:
             )
             continue
 
-        name, gpu_list, sys_info = collect_server(server)
+        name, gpu_list, sys_info, io_info = collect_server(server)
 
         if gpu_list is None:
             fails = (st["fails"] if st else 0) + 1
@@ -275,6 +350,8 @@ def collect_all() -> None:
             entry = {"timestamp": now, "gpus": gpu_list}
             if sys_info is not None:
                 entry["sys"] = sys_info
+            if io_info is not None:
+                entry["io"] = io_info
             data[name]["history"].append(entry)
 
     with data_lock:
@@ -293,10 +370,25 @@ def scheduler_loop() -> None:
 
 @app.route("/api/data")
 def api_data():
+    try:
+        hours = int(request.args.get("hours", 24))
+    except ValueError:
+        hours = 24
+    hours = max(1, min(hours, HISTORY_HOURS))
+    cutoff = time.time() - hours * 3600
+
     with data_lock:
         data = load_data()
     servers = read_server_list()
-    ordered = {s["name"]: data[s["name"]] for s in servers if s["name"] in data}
+    ordered = {}
+    for s in servers:
+        sd = data.get(s["name"])
+        if sd is None:
+            continue
+        ordered[s["name"]] = {
+            **sd,
+            "history": [h for h in sd["history"] if h["timestamp"] > cutoff],
+        }
     return jsonify(ordered)
 
 
@@ -305,14 +397,26 @@ def api_servers():
     return jsonify(read_server_list())
 
 
+@app.route("/api/peer_names")
+def api_peer_names():
+    """Extra ip -> display-name entries for hosts outside the server list."""
+    return jsonify(cfg.get("peer_names", {}))
+
+
 
 @app.route("/")
 def index():
-    return send_from_directory(app.static_folder, "index.html")
+    resp = send_from_directory(app.static_folder, "index.html")
+    resp.headers["Cache-Control"] = "no-cache"  # always revalidate the UI
+    return resp
 
 
 if __name__ == "__main__":
     DATA_FILE.parent.mkdir(exist_ok=True)
+    # PID file so the right process can be stopped: other services on this
+    # host share the exact same command line (".venv/bin/python app.py"),
+    # so name-based kills (pkill -f) hit innocent bystanders.
+    (BASE_DIR / "server.pid").write_text(str(os.getpid()))
     try:
         os.chmod(SSH_KEY, 0o600)
     except Exception:

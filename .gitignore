@@ -19,3 +19,6 @@ server_list.txt
 
 # Logs
 *.log
+
+# Runtime
+server.pid

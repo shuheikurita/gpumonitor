@@ -18,6 +18,11 @@ cp config.toml.example config.toml
 uv run python app.py
 ```
 
+The server writes its PID to `server.pid`. To stop or restart it, use
+`kill $(cat server.pid)` — do NOT use `pkill -f "python app.py"` or similar
+name matching, which also kills any other service that happens to run under
+the same command line.
+
 Then open `http://<host>:<port>/` in your browser.
 
 ## Configuration

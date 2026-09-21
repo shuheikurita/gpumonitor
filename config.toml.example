@@ -1,11 +1,16 @@
 [app]
 port = 8080
-history_hours = 24
+history_hours = 120  # retention; the UI window selector offers 24-120h
 collect_interval = 60  # seconds
 
 [ssh]
 key = "id_rsa"   # relative to project root, or absolute path
 user = "your_username"
+
+# Optional: ip -> name for traffic peers outside the server list
+# (used by the per-client NFS traffic breakdown)
+[peer_names]
+"192.168.1.100" = "old-nas"
 
 [[servers]]
 ip   = "192.168.1.10"
@@ -19,3 +24,13 @@ name = "gpu-node-02"
 ip   = "192.168.1.12"
 name = "cpu-node-01"
 gpu  = false   # no GPU: collect CPU/RAM only, skip nvidia-smi
+
+[[servers]]
+ip   = "192.168.1.13"
+name = "nas-01"
+gpu  = false
+# Optional I/O monitoring (read from /proc counters, no disk load):
+# per-device disk read/write and one NIC's rx/tx, shown as rate charts.
+netdev = "eth0"
+disks  = [ { dev = "md0", label = "/vol0" }, { dev = "md1", label = "/vol1" } ]
+nfs_peers = true  # per-client NFS traffic breakdown (ss TCP counters, port 2049)
